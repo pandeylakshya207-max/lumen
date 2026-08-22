@@ -39,3 +39,21 @@ pub fn keyword(text: &str) -> Option<TokenKind> {
         _        => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyword_let() { assert_eq!(keyword("let"), Some(TokenKind::Let)); }
+
+    #[test]
+    fn keyword_unknown() { assert_eq!(keyword("foo"), None); }
+
+    #[test]
+    fn token_position() {
+        let t = Token::new(TokenKind::Plus, 3, 7);
+        assert_eq!(t.line, 3);
+        assert_eq!(t.col, 7);
+    }
+}
