@@ -1,0 +1,15 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
