@@ -5,5 +5,9 @@ pub enum TokenKind {
     Float(f64),
     Str(String),
     Ident(String),
+
+    // Keywords
+    Let, Fn, If, Else, While, Return, True, False, Nil,
+
     Eof,
 }
