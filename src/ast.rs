@@ -20,3 +20,14 @@ pub enum Expr {
     Call   { callee: String, args: Vec<Expr> },
     Group  (Box<Expr>),
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Let    { name: String, ty: Option<Ty>, init: Expr },
+    Assign { name: String, value: Expr },
+    ExprStmt(Expr),
+    If     { cond: Expr, then: Vec<Stmt>, else_: Option<Vec<Stmt>> },
+    While  { cond: Expr, body: Vec<Stmt> },
+    Return (Expr),
+    Fn     { name: String, params: Vec<(String, Ty)>, ret: Option<Ty>, body: Vec<Stmt> },
+}
