@@ -24,3 +24,18 @@ impl Token {
         Self { kind, line, col }
     }
 }
+
+pub fn keyword(text: &str) -> Option<TokenKind> {
+    match text {
+        "let"    => Some(TokenKind::Let),
+        "fn"     => Some(TokenKind::Fn),
+        "if"     => Some(TokenKind::If),
+        "else"   => Some(TokenKind::Else),
+        "while"  => Some(TokenKind::While),
+        "return" => Some(TokenKind::Return),
+        "true"   => Some(TokenKind::True),
+        "false"  => Some(TokenKind::False),
+        "nil"    => Some(TokenKind::Nil),
+        _        => None,
+    }
+}
