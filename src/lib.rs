@@ -2,3 +2,8 @@ pub mod token;
 pub mod lexer;
 pub mod ast;
 pub mod parser;
+pub mod typeck;
+pub mod compiler;
+pub mod vm;
+pub mod interpreter;
+pub mod bench;
