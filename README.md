@@ -1,5 +1,7 @@
 # lumen
 
+> **Status: does not build.** `src/parser.rs` is empty in this repository, so the project cannot be compiled or tested as published. The lexer, type checker, bytecode compiler, VM and interpreter sources are here; the parser is being restored. The test count and benchmark described below cannot currently be reproduced from this repository.
+
 A small, statically-typed compiled language written in Rust.
 
 Lumen has **two execution backends** — a bytecode compiler + stack VM and a tree-walking interpreter — so their performance can be honestly benchmarked against each other on the same programs.
