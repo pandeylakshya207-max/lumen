@@ -1,7 +1,19 @@
 use std::io::{self, Write};
 use lumen::{compiler::Compiler, interpreter::Interpreter, parser::Parser, typeck::TypeChecker, vm::Vm, bench};
 
+/// The type checker, compiler and interpreter recurse over the syntax tree, and
+/// the interpreter recurses once more for every lumen function call. The work
+/// runs on a thread with a stack of known size so that the limits in the
+/// parser (nesting depth) and the backends (call depth) are safe on every
+/// platform, including Windows where the main thread gets only 1 MB.
+const STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() {
+    let worker = std::thread::Builder::new().stack_size(STACK_BYTES).spawn(run).expect("cannot start worker thread");
+    if worker.join().is_err() { std::process::exit(101); }
+}
+
+fn run() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--bench")  => run_bench(),
@@ -23,7 +35,10 @@ fn exec_vm(src: &str) {
     }
 }
 fn exec_interp(src: &str) {
-    let stmts = match Parser::new(src).parse_program() { Ok(s) => s, Err(e) => { eprintln!("[parse error] {}", e.msg); return; } };
+    let stmts = match Parser::new(src).parse_program() {
+        Ok(s) => s, Err(e) => { eprintln!("[parse error] {}  (line {}, col {})", e.msg, e.line, e.col); return; }
+    };
+    if let Err(e) = TypeChecker::new().check_program(&stmts) { eprintln!("[type error] {}", e.msg); return; }
     match Interpreter::new().run_program(&stmts) {
         Ok(v) => { if format!("{}", v) != "nil" { println!("{}", v); } }
         Err(e) => eprintln!("[runtime error] {}", e.0),

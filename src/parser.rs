@@ -22,8 +22,13 @@ use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::{Token, TokenKind};
 
-/// Deepest recursion the parser accepts, counted across blocks and expressions.
-/// Keeps hostile input such as ten thousand "(" from overflowing the stack.
+/// Deepest syntax tree the parser builds. Every block, bracket, unary operator
+/// and binary operator on the way down to a token counts as one level, so
+/// `1 + 2 + 3` is two levels deep and `((1))` is two levels deep.
+///
+/// The type checker, compiler and interpreter all walk the tree recursively.
+/// Bounding its depth here keeps input such as ten thousand "(" or a sum of
+/// ten thousand terms from overflowing the native stack in any of them.
 const MAX_DEPTH: usize = 100;
 
 pub struct Parser {
@@ -128,7 +133,7 @@ impl Parser {
         if self.depth > MAX_DEPTH {
             let tok = self.peek();
             return Err(ParseError {
-                msg: format!("nesting is deeper than {} levels", MAX_DEPTH),
+                msg: format!("nesting is deeper than {} levels of blocks, brackets and operators", MAX_DEPTH),
                 line: tok.line,
                 col: tok.col,
             });
@@ -281,15 +286,17 @@ impl Parser {
     /// Precedence climbing: parses a run of binary operators whose precedence
     /// is at least `min_prec`. Operators of equal precedence group to the left.
     fn parse_binary(&mut self, min_prec: u8) -> ParseResult<Expr> {
-        self.enter()?;
+        let depth_before = self.depth;
         let mut lhs = self.parse_unary()?;
         while let Some((op, prec)) = binary_op(&self.peek().kind) {
             if prec < min_prec { break; }
             self.advance();
+            // `lhs` becomes a child of the new node, so the tree is one level deeper
+            self.enter()?;
             let rhs = self.parse_binary(prec + 1)?;
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
-        self.leave();
+        self.depth = depth_before;
         Ok(lhs)
     }
 
@@ -321,7 +328,9 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
+                self.enter()?;
                 let inner = self.parse_expr()?;
+                self.leave();
                 self.expect(&TokenKind::RParen, "')'")?;
                 return Ok(Expr::Group(Box::new(inner)));
             }
@@ -333,6 +342,7 @@ impl Parser {
 
     fn parse_call(&mut self, callee: String) -> ParseResult<Expr> {
         self.advance(); // (
+        self.enter()?;
         let mut args = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
@@ -340,6 +350,7 @@ impl Parser {
                 if !self.match_tok(&TokenKind::Comma) { break; }
             }
         }
+        self.leave();
         self.expect(&TokenKind::RParen, "')' after arguments")?;
         Ok(Expr::Call { callee, args })
     }
@@ -679,11 +690,31 @@ mod tests {
         assert!(Parser::new(&"-".repeat(10_000)).parse_expr().unwrap_err().msg.contains("nesting"));
         let src = format!("{}{}", "if true { ".repeat(10_000), "}".repeat(10_000));
         assert!(err(&src).msg.contains("nesting"));
+        let src = format!("{}1{}", "f(".repeat(10_000), ")".repeat(10_000));
+        assert!(Parser::new(&src).parse_expr().unwrap_err().msg.contains("nesting"));
+        let src = format!("if a {{ }}{}", " else if a { }".repeat(10_000));
+        assert!(err(&src).msg.contains("nesting"));
     }
 
     #[test]
-    fn moderate_nesting_is_accepted() {
-        let src = format!("{}1{}", "(".repeat(50), ")".repeat(50));
-        assert!(Parser::new(&src).parse_expr().is_ok());
+    fn long_operator_chain_is_rejected_not_a_stack_overflow() {
+        let src = vec!["1"; 10_000].join(" + ");
+        assert!(Parser::new(&src).parse_expr().unwrap_err().msg.contains("nesting"));
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_is_accepted() {
+        let brackets = format!("{}1{}", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+        assert!(Parser::new(&brackets).parse_expr().is_ok());
+        let chain = vec!["1"; MAX_DEPTH + 1].join(" + ");
+        assert!(Parser::new(&chain).parse_expr().is_ok());
+        let one_more = vec!["1"; MAX_DEPTH + 2].join(" + ");
+        assert!(Parser::new(&one_more).parse_expr().is_err());
+    }
+
+    #[test]
+    fn depth_is_released_after_each_statement() {
+        let stmt = format!("{};", vec!["1"; 60].join(" + "));
+        assert_eq!(program(&stmt.repeat(50)).len(), 50);
     }
 }

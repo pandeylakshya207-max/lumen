@@ -3,6 +3,7 @@ use crate::parser::Parser;
 use crate::compiler::Compiler;
 use crate::vm::Vm;
 use crate::interpreter::Interpreter;
+use crate::typeck::TypeChecker;
 
 pub struct BenchResult {
     pub program: &'static str,
@@ -21,6 +22,7 @@ impl std::fmt::Display for BenchResult {
 }
 pub fn bench(program: &'static str, iters: u32) -> BenchResult {
     let stmts = Parser::new(program).parse_program().expect("parse");
+    TypeChecker::new().check_program(&stmts).expect("type check");
     let mut compiler = Compiler::new();
     let chunk = compiler.compile_program(&stmts).expect("compile");
     let fns = compiler.fns.clone();
@@ -35,14 +37,18 @@ pub fn bench(program: &'static str, iters: u32) -> BenchResult {
                   else { vm_ns as f64 / interp_ns.max(1) as f64 };
     BenchResult { program, vm_ns, interp_ns, vm_faster, speedup }
 }
-pub fn run_suite() -> Vec<BenchResult> {
-    const ITERS: u32 = 10_000;
+pub fn run_suite() -> Vec<BenchResult> { run_suite_with(10_000) }
+
+/// The benchmark programs, each run `iters` times on both backends.
+pub fn run_suite_with(iters: u32) -> Vec<BenchResult> {
     vec![
-        bench("1 + 2;", ITERS),
-        bench("let x = 10; let y = 20; let z = x + y; z;", ITERS),
-        bench("fn add(a: int, b: int) { return a; } add(3, 4);", ITERS),
-        bench("let x = true; if x { let y = 1; } else { let y = 2; } nil;", ITERS),
-        bench("let a = 0; let b = 1; let i = 0; while i < 10 { let tmp = b; b = a + b; a = tmp; i = i + 1; } a;", ITERS),
+        bench("1 + 2;", iters),
+        bench("let x = 10; let y = 20; let z = x + y; z;", iters),
+        bench("fn add(a: int, b: int) -> int { return a + b; } add(3, 4);", iters),
+        bench("let x = true; if x { let y = 1; } else { let y = 2; } nil;", iters),
+        bench("let a = 0; let b = 1; let i = 0; while i < 10 { let tmp = b; b = a + b; a = tmp; i = i + 1; } a;", iters),
+        bench("fn fib(n: int) -> int { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fib(10);", iters),
+        bench("let x = 1.5; let i = 0; while i < 20 { x = x * 1.01 + 0.5; i = i + 1; } x;", iters),
     ]
 }
 #[cfg(test)]
@@ -50,8 +56,8 @@ mod tests {
     use super::*;
     #[test]
     fn bench_runs_without_panic() {
-        let results = run_suite();
-        assert_eq!(results.len(), 5);
+        let results = run_suite_with(50);
+        assert_eq!(results.len(), 7);
         for r in &results { let _ = format!("{}", r); }
     }
     #[test]

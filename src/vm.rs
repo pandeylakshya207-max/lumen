@@ -30,6 +30,8 @@ pub struct Vm {
     fns: HashMap<String, Chunk>,
     /// call stack
     frames: Vec<Frame>,
+    /// value of the most recently executed expression statement
+    result: Value,
 }
 
 impl Vm {
@@ -39,10 +41,12 @@ impl Vm {
             locals: Vec::new(),
             fns,
             frames: Vec::new(),
+            result: Value::Nil,
         }
     }
 
-    /// Run a main chunk to completion, return the top-of-stack value (or Nil).
+    /// Run a main chunk to completion. Returns the value of the last expression
+    /// statement that ran, or Nil when there was none.
     pub fn run(&mut self, chunk: Chunk) -> VmResult<Value> {
         self.frames.push(Frame { chunk, ip: 0, locals_base: 0 });
 
@@ -59,31 +63,33 @@ impl Vm {
 
                 Op::Const(v) => self.stack.push(v),
 
+                Op::Pop => { self.result = self.pop()?; }
+
                 // ── arithmetic ────────────────────────────────────────────
-                Op::AddInt   => { let (a,b) = self.pop2_int()?;   self.stack.push(Value::Int(a + b)); }
+                Op::AddInt   => { let (a,b) = self.pop2_int()?;   self.push_int(a.checked_add(b))?; }
                 Op::AddFloat => { let (a,b) = self.pop2_float()?; self.stack.push(Value::Float(a + b)); }
                 Op::AddStr   => {
                     let b = self.pop_str()?; let a = self.pop_str()?;
                     self.stack.push(Value::Str(a + &b));
                 }
-                Op::SubInt   => { let (a,b) = self.pop2_int()?;   self.stack.push(Value::Int(a - b)); }
+                Op::SubInt   => { let (a,b) = self.pop2_int()?;   self.push_int(a.checked_sub(b))?; }
                 Op::SubFloat => { let (a,b) = self.pop2_float()?; self.stack.push(Value::Float(a - b)); }
-                Op::MulInt   => { let (a,b) = self.pop2_int()?;   self.stack.push(Value::Int(a * b)); }
+                Op::MulInt   => { let (a,b) = self.pop2_int()?;   self.push_int(a.checked_mul(b))?; }
                 Op::MulFloat => { let (a,b) = self.pop2_float()?; self.stack.push(Value::Float(a * b)); }
                 Op::DivInt   => {
                     let (a,b) = self.pop2_int()?;
                     if b == 0 { return Err(VmError("division by zero".into())); }
-                    self.stack.push(Value::Int(a / b));
+                    self.push_int(a.checked_div(b))?;
                 }
                 Op::DivFloat => { let (a,b) = self.pop2_float()?; self.stack.push(Value::Float(a / b)); }
                 Op::ModInt   => {
                     let (a,b) = self.pop2_int()?;
                     if b == 0 { return Err(VmError("modulo by zero".into())); }
-                    self.stack.push(Value::Int(a % b));
+                    self.push_int(a.checked_rem(b))?;
                 }
 
                 // ── unary ─────────────────────────────────────────────────
-                Op::NegInt   => { let n = self.pop_int()?;   self.stack.push(Value::Int(-n)); }
+                Op::NegInt   => { let n = self.pop_int()?;   self.push_int(n.checked_neg())?; }
                 Op::NegFloat => { let f = self.pop_float()?; self.stack.push(Value::Float(-f)); }
                 Op::Not      => { let b = self.pop_bool()?;  self.stack.push(Value::Bool(!b)); }
 
@@ -104,6 +110,9 @@ impl Vm {
                 Op::NeqFloat => { let (a,b) = self.pop2_float()?; self.stack.push(Value::Bool(a != b)); }
                 Op::NeqBool  => { let (a,b) = self.pop2_bool()?;  self.stack.push(Value::Bool(a != b)); }
                 Op::NeqStr   => { let b = self.pop_str()?; let a = self.pop_str()?; self.stack.push(Value::Bool(a != b)); }
+                // nil has a single value, so two nils are always equal
+                Op::EqNil    => { self.pop_nil()?; self.pop_nil()?; self.stack.push(Value::Bool(true)); }
+                Op::NeqNil   => { self.pop_nil()?; self.pop_nil()?; self.stack.push(Value::Bool(false)); }
 
                 // ── logical ───────────────────────────────────────────────
                 Op::And => { let (a,b) = self.pop2_bool()?; self.stack.push(Value::Bool(a && b)); }
@@ -143,6 +152,10 @@ impl Vm {
                 Op::Call(name, arity) => {
                     let chunk = self.fns.get(&name).cloned()
                         .ok_or_else(|| VmError(format!("undefined function '{}'", name)))?;
+                    // frames[0] is the main program, the rest are calls
+                    if self.frames.len() > crate::MAX_CALL_DEPTH {
+                        return Err(VmError(format!("stack overflow: more than {} nested calls", crate::MAX_CALL_DEPTH)));
+                    }
 
                     // args are on the stack (last pushed = last param)
                     let stack_base = self.stack.len().saturating_sub(arity);
@@ -163,8 +176,8 @@ impl Vm {
                     // free locals allocated in this frame
                     self.locals.truncate(frame.locals_base);
                     if self.frames.is_empty() {
-                        // returned from main — shouldn't happen normally (Halt is used)
-                        self.stack.push(ret_val);
+                        // top-level `return`: its value is the result of the program
+                        self.result = ret_val;
                         break;
                     }
                     self.stack.push(ret_val);
@@ -174,17 +187,32 @@ impl Vm {
                 Op::Print => {
                     let val = self.stack.pop().ok_or_else(|| VmError("print: empty stack".into()))?;
                     println!("{}", val);
+                    // print is an expression like any other call; its value is nil
+                    self.stack.push(Value::Nil);
                 }
             }
         }
 
-        Ok(self.stack.last().cloned().unwrap_or(Value::Nil))
+        Ok(self.result.clone())
     }
 
     // ── stack helpers ─────────────────────────────────────────────────────────
 
     fn pop(&mut self) -> VmResult<Value> {
         self.stack.pop().ok_or_else(|| VmError("stack underflow".into()))
+    }
+
+    /// Push the result of checked integer arithmetic; None means it overflowed.
+    fn push_int(&mut self, n: Option<i64>) -> VmResult<()> {
+        self.stack.push(Value::Int(n.ok_or_else(|| VmError("integer overflow".into()))?));
+        Ok(())
+    }
+
+    fn pop_nil(&mut self) -> VmResult<()> {
+        match self.pop()? {
+            Value::Nil => Ok(()),
+            v => Err(VmError(format!("expected nil, got {:?}", v))),
+        }
     }
 
     fn pop_int(&mut self) -> VmResult<i64> {
@@ -344,6 +372,126 @@ mod tests {
     #[test]
     fn assign_chain() {
         assert_eq!(run("let x = 0; x = 1; x = x + 1; x;"), Value::Int(2));
+    }
+
+    // typed opcodes follow the static type, not the shape of the left operand
+    #[test]
+    fn float_chain() { assert_eq!(run("1.0 + 2.0 + 3.0;"), Value::Float(6.0)); }
+
+    #[test]
+    fn float_group() { assert_eq!(run("(1.0 + 2.0) * 3.0;"), Value::Float(9.0)); }
+
+    #[test]
+    fn float_variable() {
+        assert_eq!(run("let x = 1.5; x + 2.5;"), Value::Float(4.0));
+        assert_eq!(run("let x = 1.5; x < 2.5;"), Value::Bool(true));
+        assert_eq!(run("let x = 2.5; -x;"), Value::Float(-2.5));
+        assert_eq!(run("let x = 2.5; -(x * 2.0);"), Value::Float(-5.0));
+    }
+
+    #[test]
+    fn annotated_variable() {
+        assert_eq!(run("let x: float = 3.0; x / 2.0;"), Value::Float(1.5));
+    }
+
+    #[test]
+    fn str_variable() {
+        assert_eq!(run(r#"let a = "foo"; let b = a + "bar"; b + "!";"#), Value::Str("foobar!".into()));
+        assert_eq!(run(r#"let a = "x"; a == "x";"#), Value::Bool(true));
+        assert_eq!(run(r#"let a = "x"; a != "x";"#), Value::Bool(false));
+    }
+
+    #[test]
+    fn bool_variable() {
+        assert_eq!(run("let b = true; b == true;"), Value::Bool(true));
+        assert_eq!(run("let b = 1 < 2; b != false;"), Value::Bool(true));
+    }
+
+    #[test]
+    fn float_param_and_return() {
+        assert_eq!(run("fn half(x: float) -> float { return x / 2.0; } half(5.0);"), Value::Float(2.5));
+        assert_eq!(run("fn half(x: float) -> float { return x / 2.0; } half(5.0) + half(3.0) * 2.0;"), Value::Float(5.5));
+    }
+
+    #[test]
+    fn call_before_declaration_uses_declared_return_type() {
+        assert_eq!(run("fn a() -> float { return b() * 2.0; } fn b() -> float { return 1.5; } a();"), Value::Float(3.0));
+    }
+
+    #[test]
+    fn float_assigned_in_loop() {
+        assert_eq!(run("let x = 1.0; let i = 0; while i < 3 { x = x * 2.0; i = i + 1; } x;"), Value::Float(8.0));
+    }
+
+    #[test]
+    fn shadowing_changes_the_type() {
+        assert_eq!(run("let x = 1; if true { let x = 1.5; x + 1.0; }"), Value::Float(2.5));
+        assert_eq!(run("let x = 1.5; let x = 2; x + 1;"), Value::Int(3));
+    }
+
+    #[test]
+    fn nil_equality() {
+        assert_eq!(run("nil == nil;"), Value::Bool(true));
+        assert_eq!(run("nil != nil;"), Value::Bool(false));
+    }
+
+    // expression statements leave nothing behind on the operand stack
+    #[test]
+    fn expr_stmt_inside_fn_does_not_corrupt_the_caller() {
+        assert_eq!(run("fn f(x: float) -> float { 5 / 4; return x + 1.0; } f(1.0) + f(2.0);"), Value::Float(5.0));
+    }
+
+    #[test]
+    fn expr_stmts_in_a_loop_do_not_grow_the_stack() {
+        let stmts = crate::parser::Parser::new("let i = 0; while i < 1000 { i; i = i + 1; } i;").parse_program().unwrap();
+        let mut c = crate::compiler::Compiler::new();
+        let chunk = c.compile_program(&stmts).unwrap();
+        let mut vm = Vm::new(c.fns);
+        assert_eq!(vm.run(chunk), Ok(Value::Int(1000)));
+        assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn result_is_the_last_expression_statement() {
+        assert_eq!(run("1; let x = 2;"), Value::Int(1));
+        assert_eq!(run("if false { 1; } else { 99; }"), Value::Int(99));
+        assert_eq!(run("let x = 2;"), Value::Nil);
+    }
+
+    #[test]
+    fn print_is_an_expression() {
+        assert_eq!(run(r#"let r = print("hi"); r;"#), Value::Nil);
+    }
+
+    #[test]
+    fn top_level_return_ends_the_program() {
+        assert_eq!(run("1; return 7; 2;"), Value::Int(7));
+    }
+
+    #[test]
+    fn recursion() {
+        assert_eq!(run("fn fib(n: int) -> int { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fib(15);"), Value::Int(610));
+    }
+
+    #[test]
+    fn deep_recursion_up_to_the_limit() {
+        assert_eq!(run("fn down(n: int) -> int { if n == 0 { return 0; } return 1 + down(n - 1); } down(999);"), Value::Int(999));
+    }
+
+    #[test]
+    fn runaway_recursion_is_an_error() {
+        assert_eq!(run_err("fn f(n: int) -> int { return f(n + 1); } f(0);"), "stack overflow: more than 1000 nested calls");
+    }
+
+    // integer overflow is an error, not a panic or a silent wrap
+    #[test]
+    fn int_overflow() {
+        assert_eq!(run_err("9223372036854775807 + 1;"), "integer overflow");
+        assert_eq!(run_err("0 - 9223372036854775807 - 2;"), "integer overflow");
+        assert_eq!(run_err("9223372036854775807 * 2;"), "integer overflow");
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; min / -1;"), "integer overflow");
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; min % -1;"), "integer overflow");
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; -min;"), "integer overflow");
     }
 
     // runtime errors

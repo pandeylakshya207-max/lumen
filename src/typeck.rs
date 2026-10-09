@@ -188,16 +188,19 @@ impl TypeChecker {
                 let param_tys: Vec<Ty> = params.iter().map(|(_, ty)| ty.clone()).collect();
                 self.fns.insert(name.clone(), FnSig { params: param_tys, ret: ret_ty.clone() });
 
-                // check body in a new scope with params defined
+                // A function body sees only its parameters and its own locals,
+                // never the variables of the code around it, so it is checked
+                // in a fresh environment.
                 let prev_ret = self.current_ret.replace(ret_ty);
+                let outer = std::mem::take(&mut self.env);
                 self.env.push();
                 for (pname, pty) in params {
                     self.env.define(pname, pty.clone());
                 }
-                for s in body { self.check_stmt(s)?; }
-                self.env.pop();
+                let checked = body.iter().try_for_each(|s| self.check_stmt(s));
+                self.env = outer;
                 self.current_ret = prev_ret;
-                Ok(())
+                checked
             }
         }
     }
@@ -281,7 +284,8 @@ fn check_binary(op: &BinOp, lt: &Ty, rt: &Ty) -> TyResult<Ty> {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
             match (lt, rt) {
                 (Ty::Int,   Ty::Int)   => Ok(Ty::Int),
-                (Ty::Float, Ty::Float) => Ok(Ty::Float),
+                // `%` is defined on ints only
+                (Ty::Float, Ty::Float) if *op != BinOp::Mod => Ok(Ty::Float),
                 // str + str -> str (concatenation)
                 (Ty::Str,   Ty::Str) if *op == BinOp::Add => Ok(Ty::Str),
                 _ => Err(TypeError::new(format!(
@@ -503,6 +507,27 @@ mod tests {
     fn scope_isolation() {
         // variable defined inside if block not visible outside
         assert!(check("if true { let x = 1; } let y = x;").is_err());
+    }
+
+    #[test]
+    fn fn_body_does_not_see_outer_variables() {
+        assert!(check("let g = 1; fn f() -> int { return g; }").is_err());
+    }
+
+    #[test]
+    fn outer_scope_survives_a_fn_declaration() {
+        assert!(check("let g = 1; fn f(a: int) -> int { return a; } let h = g;").is_ok());
+    }
+
+    #[test]
+    fn fn_param_may_reuse_an_outer_name() {
+        assert!(check("let x = true; fn f(x: int) -> int { return x + 1; } f(2);").is_ok());
+    }
+
+    #[test]
+    fn mod_is_int_only() {
+        assert_eq!(check_expr_ty("7 % 3"), Ok(Ty::Int));
+        assert!(check_expr_ty("7.0 % 3.0").is_err());
     }
 
     #[test]

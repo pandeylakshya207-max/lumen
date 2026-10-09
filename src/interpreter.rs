@@ -71,13 +71,15 @@ pub struct Interpreter {
     fns:      HashMap<String, FnDef>,
     /// value of the most recently evaluated expression statement
     last_val: Value,
+    /// number of function calls currently active
+    call_depth: usize,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         let mut env = Env::default();
         env.push(); // global scope
-        Self { env, fns: HashMap::new(), last_val: Value::Nil }
+        Self { env, fns: HashMap::new(), last_val: Value::Nil, call_depth: 0 }
     }
 
     /// Run a full program; return the last expression-statement value, or Nil.
@@ -188,7 +190,7 @@ impl Interpreter {
                 let v = self.eval_expr(expr)?;
                 match op {
                     UnOp::Neg => match v {
-                        Value::Int(n)   => Ok(Value::Int(-n)),
+                        Value::Int(n)   => n.checked_neg().map(Value::Int).ok_or_else(overflow),
                         Value::Float(f) => Ok(Value::Float(-f)),
                         _ => Err(InterpError(format!("unary '-' on non-numeric: {:?}", v))),
                     },
@@ -230,15 +232,23 @@ impl Interpreter {
                     .map(|a| self.eval_expr(a))
                     .collect::<InterpResult<_>>()?;
 
-                // execute body in fresh scope
+                if self.call_depth >= crate::MAX_CALL_DEPTH {
+                    return Err(InterpError(format!("stack overflow: more than {} nested calls", crate::MAX_CALL_DEPTH)));
+                }
+
+                // A function body sees only its parameters and its own locals,
+                // so it runs in a fresh environment, not on top of the caller's.
+                let caller_env = std::mem::take(&mut self.env);
                 self.env.push();
                 for ((pname, _), val) in def.params.iter().zip(arg_vals) {
                     self.env.define(pname, val);
                 }
-                let sig = self.exec_block(&def.body)?;
-                self.env.pop();
+                self.call_depth += 1;
+                let sig = self.exec_block(&def.body);
+                self.call_depth -= 1;
+                self.env = caller_env;
 
-                Ok(match sig {
+                Ok(match sig? {
                     Signal::Return(v) => v,
                     Signal::None      => Value::Nil,
                 })
@@ -252,25 +262,25 @@ impl Interpreter {
 fn eval_binary(op: &BinOp, lv: Value, rv: Value) -> InterpResult<Value> {
     match op {
         BinOp::Add => match (lv, rv) {
-            (Value::Int(a),   Value::Int(b))   => Ok(Value::Int(a + b)),
+            (Value::Int(a),   Value::Int(b))   => a.checked_add(b).map(Value::Int).ok_or_else(overflow),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Str(a),   Value::Str(b))   => Ok(Value::Str(a + &b)),
             (l, r) => Err(binop_err("+", &l, &r)),
         },
         BinOp::Sub => match (lv, rv) {
-            (Value::Int(a),   Value::Int(b))   => Ok(Value::Int(a - b)),
+            (Value::Int(a),   Value::Int(b))   => a.checked_sub(b).map(Value::Int).ok_or_else(overflow),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (l, r) => Err(binop_err("-", &l, &r)),
         },
         BinOp::Mul => match (lv, rv) {
-            (Value::Int(a),   Value::Int(b))   => Ok(Value::Int(a * b)),
+            (Value::Int(a),   Value::Int(b))   => a.checked_mul(b).map(Value::Int).ok_or_else(overflow),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (l, r) => Err(binop_err("*", &l, &r)),
         },
         BinOp::Div => match (lv, rv) {
             (Value::Int(a),   Value::Int(b)) => {
                 if b == 0 { return Err(InterpError("division by zero".into())); }
-                Ok(Value::Int(a / b))
+                a.checked_div(b).map(Value::Int).ok_or_else(overflow)
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (l, r) => Err(binop_err("/", &l, &r)),
@@ -278,7 +288,7 @@ fn eval_binary(op: &BinOp, lv: Value, rv: Value) -> InterpResult<Value> {
         BinOp::Mod => match (lv, rv) {
             (Value::Int(a), Value::Int(b)) => {
                 if b == 0 { return Err(InterpError("modulo by zero".into())); }
-                Ok(Value::Int(a % b))
+                a.checked_rem(b).map(Value::Int).ok_or_else(overflow)
             }
             (l, r) => Err(binop_err("%", &l, &r)),
         },
@@ -302,8 +312,11 @@ fn eval_binary(op: &BinOp, lv: Value, rv: Value) -> InterpResult<Value> {
 fn cmp_op(lv: Value, rv: Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> InterpResult<Value> {
     let ord = match (&lv, &rv) {
         (Value::Int(a),   Value::Int(b))   => a.cmp(b),
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b)
-            .ok_or_else(|| InterpError("NaN comparison".into()))?,
+        (Value::Float(a), Value::Float(b)) => match a.partial_cmp(b) {
+            Some(ord) => ord,
+            // NaN is neither less than, equal to nor greater than anything
+            None => return Ok(Value::Bool(false)),
+        },
         _ => return Err(binop_err("</>", &lv, &rv)),
     };
     Ok(Value::Bool(pred(ord)))
@@ -327,6 +340,8 @@ fn truthy(v: &Value) -> bool {
         _              => true,
     }
 }
+
+fn overflow() -> InterpError { InterpError("integer overflow".into()) }
 
 fn binop_err(op: &str, l: &Value, r: &Value) -> InterpError {
     InterpError(format!("type error: cannot apply '{}' to {:?} and {:?}", op, l, r))
@@ -469,6 +484,70 @@ mod tests {
     #[test]
     fn assign_undefined_err() {
         assert!(run_err("x = 1;").contains("undefined variable"));
+    }
+
+    // functions are closed
+    #[test]
+    fn fn_does_not_see_caller_variables() {
+        assert!(run_err("let g = 1; fn f() { return g; } f();").contains("undefined variable 'g'"));
+    }
+
+    #[test]
+    fn caller_variables_survive_a_call() {
+        assert_eq!(run("let x = 1; fn f(x: int) { x = 99; return x; } f(5); x;"), Value::Int(1));
+    }
+
+    #[test]
+    fn caller_variables_survive_a_failed_call() {
+        let mut it = Interpreter::new();
+        let stmts = crate::parser::Parser::new("let x = 7; fn f() { return 1 / 0; } f();").parse_program().unwrap();
+        assert!(it.run_program(&stmts).is_err());
+        assert_eq!(it.env.get("x"), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn recursion() {
+        assert_eq!(run("fn fact(n: int) -> int { if n <= 1 { return 1; } return n * fact(n - 1); } fact(10);"), Value::Int(3628800));
+    }
+
+    /// Each call in the interpreter is several native frames, so tests that
+    /// recurse deeply run on a thread with a large stack, as the CLI does.
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(f).unwrap().join().unwrap()
+    }
+
+    #[test]
+    fn deep_recursion_up_to_the_limit() {
+        let v = on_big_stack(|| run("fn down(n: int) -> int { if n == 0 { return 0; } return 1 + down(n - 1); } down(999);"));
+        assert_eq!(v, Value::Int(999));
+    }
+
+    #[test]
+    fn runaway_recursion_is_an_error() {
+        let e = on_big_stack(|| run_err("fn f(n: int) -> int { return f(n + 1); } f(0);"));
+        assert_eq!(e, "stack overflow: more than 1000 nested calls");
+    }
+
+    // integer overflow is an error, not a panic or a silent wrap
+    #[test]
+    fn int_overflow() {
+        assert_eq!(run_err("9223372036854775807 + 1;"), "integer overflow");
+        assert_eq!(run_err("0 - 9223372036854775807 - 2;"), "integer overflow");
+        assert_eq!(run_err("9223372036854775807 * 2;"), "integer overflow");
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; min / -1;"), "integer overflow");
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; -min;"), "integer overflow");
+    }
+
+    #[test]
+    fn min_int_mod_minus_one_overflows() {
+        assert_eq!(run_err("let min = 0 - 9223372036854775807 - 1; min % -1;"), "integer overflow");
+    }
+
+    #[test]
+    fn nan_compares_false() {
+        assert_eq!(run("let nan = 0.0 / 0.0; nan < 1.0;"), Value::Bool(false));
+        assert_eq!(run("let nan = 0.0 / 0.0; nan >= 1.0;"), Value::Bool(false));
+        assert_eq!(run("let nan = 0.0 / 0.0; nan == nan;"), Value::Bool(false));
     }
 
     // equality across types

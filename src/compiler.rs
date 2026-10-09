@@ -33,6 +33,10 @@ pub enum Op {
     // push a constant onto the stack
     Const(Value),
 
+    // pop the value of an expression statement; the VM keeps the most recent
+    // one as the result of the program
+    Pop,
+
     // arithmetic
     AddInt, AddFloat, AddStr,
     SubInt, SubFloat,
@@ -41,8 +45,8 @@ pub enum Op {
     ModInt,
 
     // comparison (all produce Bool on stack)
-    EqInt, EqFloat, EqBool, EqStr,
-    NeqInt, NeqFloat, NeqBool, NeqStr,
+    EqInt, EqFloat, EqBool, EqStr, EqNil,
+    NeqInt, NeqFloat, NeqBool, NeqStr, NeqNil,
     LtInt, LtFloat,
     LtEqInt, LtEqFloat,
     GtInt, GtFloat,
@@ -113,22 +117,35 @@ pub type CompileResult<T> = Result<T, CompileError>;
 pub struct Compiler {
     /// locals stack: each entry is (name, slot_index)
     locals: Vec<(String, usize)>,
+    /// static type of each entry in `locals`, when it is known
+    local_tys: Vec<Option<Ty>>,
     next_slot: usize,
     /// compiled function bodies: name -> Chunk
     pub fns: std::collections::HashMap<String, Chunk>,
+    /// declared return type of each function that has one
+    fn_rets: std::collections::HashMap<String, Ty>,
 }
 
 impl Compiler {
     pub fn new() -> Self {
         Self {
             locals: Vec::new(),
+            local_tys: Vec::new(),
             next_slot: 0,
             fns: std::collections::HashMap::new(),
+            fn_rets: std::collections::HashMap::new(),
         }
     }
 
     /// Compile a full program into a main Chunk.
     pub fn compile_program(&mut self, stmts: &[Stmt]) -> CompileResult<Chunk> {
+        // record declared return types first, so a call compiles the same way
+        // whether the function is declared before or after it
+        for stmt in stmts {
+            if let Stmt::Fn { name, ret: Some(ty), .. } = stmt {
+                self.fn_rets.insert(name.clone(), ty.clone());
+            }
+        }
         // first pass: compile all fn declarations into self.fns
         for stmt in stmts {
             if let Stmt::Fn { name, params, body, .. } = stmt {
@@ -150,14 +167,16 @@ impl Compiler {
     fn compile_fn(&mut self, params: &[(String, Ty)], body: &[Stmt]) -> CompileResult<Chunk> {
         // save outer locals
         let saved_locals = std::mem::take(&mut self.locals);
+        let saved_tys    = std::mem::take(&mut self.local_tys);
         let saved_slot   = self.next_slot;
         self.next_slot = 0;
 
         // bind params as first locals
-        for (name, _) in params {
+        for (name, ty) in params {
             let slot = self.next_slot;
             self.next_slot += 1;
             self.locals.push((name.clone(), slot));
+            self.local_tys.push(known(ty));
         }
 
         let mut chunk = Chunk::default();
@@ -170,6 +189,7 @@ impl Compiler {
 
         // restore outer locals
         self.locals = saved_locals;
+        self.local_tys = saved_tys;
         self.next_slot = saved_slot;
         Ok(chunk)
     }
@@ -180,11 +200,14 @@ impl Compiler {
 impl Compiler {
     fn compile_stmt(&mut self, stmt: &Stmt, chunk: &mut Chunk) -> CompileResult<()> {
         match stmt {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let { name, ty, init } => {
                 self.compile_expr(init, chunk)?;
+                // work out the type before the name is bound: `let x = x;` reads the outer x
+                let static_ty = ty.as_ref().and_then(known).or_else(|| self.type_of(init));
                 let slot = self.next_slot;
                 self.next_slot += 1;
                 self.locals.push((name.clone(), slot));
+                self.local_tys.push(static_ty);
                 chunk.emit(Op::StoreLocal(slot));
             }
 
@@ -196,6 +219,9 @@ impl Compiler {
 
             Stmt::ExprStmt(expr) => {
                 self.compile_expr(expr, chunk)?;
+                // every expression leaves exactly one value; take it off again
+                // so statements do not pile values up on the operand stack
+                chunk.emit(Op::Pop);
             }
 
             Stmt::Return(expr) => {
@@ -243,6 +269,7 @@ impl Compiler {
         }
         // pop locals introduced in this block
         self.locals.truncate(locals_before);
+        self.local_tys.truncate(locals_before);
         self.next_slot = slot_before;
         Ok(())
     }
@@ -270,19 +297,8 @@ impl Compiler {
                 self.compile_expr(expr, chunk)?;
                 match op {
                     UnOp::Neg => {
-                        // type checker already verified int|float — peek at last Const if possible
-                        // but at compile time we don't track types; emit both and let VM decide
-                        // for simplicity: NegInt if previous Const was Int, else NegFloat
-                        // Better: emit a generic Neg — but we have typed ops. Use NegInt as default;
-                        // the type checker ensures this is safe.
-                        chunk.emit(Op::NegInt); // overridden below for float
-                        // patch: if last emitted before NegInt was Const(Float), swap to NegFloat
-                        let len = chunk.ops.len();
-                        if len >= 2 {
-                            if let Op::Const(Value::Float(_)) = &chunk.ops[len-2] {
-                                *chunk.ops.last_mut().unwrap() = Op::NegFloat;
-                            }
-                        }
+                        let is_float = self.type_of(expr) == Some(Ty::Float);
+                        chunk.emit(if is_float { Op::NegFloat } else { Op::NegInt });
                     }
                     UnOp::Not => { chunk.emit(Op::Not); }
                 }
@@ -296,8 +312,11 @@ impl Compiler {
 
             Expr::Call { callee, args } => {
                 if callee == "print" {
-                    // built-in
-                    for arg in args { self.compile_expr(arg, chunk)?; }
+                    // built-in: prints its first argument (nil when there is none)
+                    match args.first() {
+                        Some(arg) => self.compile_expr(arg, chunk)?,
+                        None => { chunk.emit(Op::Const(Value::Nil)); }
+                    }
                     chunk.emit(Op::Print);
                 } else {
                     for arg in args { self.compile_expr(arg, chunk)?; }
@@ -316,18 +335,22 @@ impl Compiler {
     }
 
     /// Emit the right typed opcode for a binary operator.
-    /// We peek at the LHS expression to decide int vs float.
-    fn compile_binop(&self, op: &BinOp, lhs: &Expr, _rhs: &Expr, chunk: &mut Chunk) {
-        let is_float = expr_is_float(lhs);
-        let is_str   = expr_is_str(lhs);
+    /// The operand type comes from the static type of the left side, or of the
+    /// right side when the left is not known. With neither known the int opcode is used.
+    fn compile_binop(&self, op: &BinOp, lhs: &Expr, rhs: &Expr, chunk: &mut Chunk) {
+        let ty = self.type_of(lhs).or_else(|| self.type_of(rhs));
+        let is_float = ty == Some(Ty::Float);
+        let is_str   = ty == Some(Ty::Str);
+        let is_bool  = ty == Some(Ty::Bool);
+        let is_nil   = ty == Some(Ty::Nil);
         let instr = match op {
             BinOp::Add  => if is_str { Op::AddStr } else if is_float { Op::AddFloat } else { Op::AddInt },
             BinOp::Sub  => if is_float { Op::SubFloat } else { Op::SubInt },
             BinOp::Mul  => if is_float { Op::MulFloat } else { Op::MulInt },
             BinOp::Div  => if is_float { Op::DivFloat } else { Op::DivInt },
             BinOp::Mod  => Op::ModInt,
-            BinOp::Eq   => if is_float { Op::EqFloat } else if is_str { Op::EqStr } else if expr_is_bool(lhs) { Op::EqBool } else { Op::EqInt },
-            BinOp::NotEq=> if is_float { Op::NeqFloat } else if is_str { Op::NeqStr } else if expr_is_bool(lhs) { Op::NeqBool } else { Op::NeqInt },
+            BinOp::Eq   => if is_float { Op::EqFloat } else if is_str { Op::EqStr } else if is_bool { Op::EqBool } else if is_nil { Op::EqNil } else { Op::EqInt },
+            BinOp::NotEq=> if is_float { Op::NeqFloat } else if is_str { Op::NeqStr } else if is_bool { Op::NeqBool } else if is_nil { Op::NeqNil } else { Op::NeqInt },
             BinOp::Lt   => if is_float { Op::LtFloat }   else { Op::LtInt },
             BinOp::LtEq => if is_float { Op::LtEqFloat } else { Op::LtEqInt },
             BinOp::Gt   => if is_float { Op::GtFloat }   else { Op::GtInt },
@@ -337,17 +360,38 @@ impl Compiler {
         };
         chunk.ops.push(instr);
     }
+
+    /// Static type of an expression, or None when it cannot be told from the
+    /// declarations in scope (a user-defined type, or a call to a function
+    /// with no declared return type).
+    fn type_of(&self, expr: &Expr) -> Option<Ty> {
+        match expr {
+            Expr::Int(_)   => Some(Ty::Int),
+            Expr::Float(_) => Some(Ty::Float),
+            Expr::Str(_)   => Some(Ty::Str),
+            Expr::Bool(_)  => Some(Ty::Bool),
+            Expr::Nil      => Some(Ty::Nil),
+            Expr::Group(inner) => self.type_of(inner),
+            Expr::Var(name) => self.locals.iter().rposition(|(n, _)| n == name)
+                .and_then(|i| self.local_tys[i].clone()),
+            Expr::Unary { op: UnOp::Not, .. } => Some(Ty::Bool),
+            Expr::Unary { op: UnOp::Neg, expr } => self.type_of(expr),
+            Expr::Binary { op, lhs, rhs } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod =>
+                    self.type_of(lhs).or_else(|| self.type_of(rhs)),
+                _ => Some(Ty::Bool),
+            },
+            Expr::Call { callee, .. } => {
+                if callee == "print" { Some(Ty::Nil) } else { self.fn_rets.get(callee).and_then(known) }
+            }
+        }
+    }
 }
 
-// ── helpers for static type hints from Expr shape ────────────────────────────
-
-fn expr_is_float(e: &Expr) -> bool {
-    matches!(e, Expr::Float(_))
-        || matches!(e, Expr::Unary { op: UnOp::Neg, expr } if matches!(expr.as_ref(), Expr::Float(_)))
+/// A declared type the compiler can pick opcodes from; a user-defined name is not one.
+fn known(ty: &Ty) -> Option<Ty> {
+    if matches!(ty, Ty::Named(_)) { None } else { Some(ty.clone()) }
 }
-
-fn expr_is_str(e: &Expr) -> bool { matches!(e, Expr::Str(_)) }
-fn expr_is_bool(e: &Expr) -> bool { matches!(e, Expr::Bool(_) | Expr::Unary { op: UnOp::Not, .. }) }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
@@ -363,8 +407,11 @@ mod tests {
     }
 
     fn compile_expr(src: &str) -> Vec<Op> {
-        // wrap in expr stmt so compile_program works
-        compile(&format!("{};", src))
+        // wrap in expr stmt so compile_program works, then drop the Pop that
+        // ends the statement so the tests below show only the expression
+        let mut ops = compile(&format!("{};", src));
+        assert_eq!(ops.remove(ops.len() - 2), Op::Pop);
+        ops
     }
 
     #[test]
@@ -553,6 +600,64 @@ mod tests {
         let stmts = Parser::new("let y = x;").parse_program().unwrap();
         let result = Compiler::new().compile_program(&stmts);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn expr_stmt_is_popped() {
+        assert_eq!(compile("1; 2;"), vec![
+            Op::Const(Value::Int(1)), Op::Pop, Op::Const(Value::Int(2)), Op::Pop, Op::Halt,
+        ]);
+    }
+
+    #[test]
+    fn opcode_follows_variable_type() {
+        assert_eq!(compile("let x = 1.5; let y = x + x;"), vec![
+            Op::Const(Value::Float(1.5)), Op::StoreLocal(0),
+            Op::LoadLocal(0), Op::LoadLocal(0), Op::AddFloat, Op::StoreLocal(1),
+            Op::Halt,
+        ]);
+    }
+
+    #[test]
+    fn opcode_follows_nested_expression_type() {
+        assert_eq!(compile_expr("1.0 + 2.0 + 3.0"), vec![
+            Op::Const(Value::Float(1.0)), Op::Const(Value::Float(2.0)), Op::AddFloat,
+            Op::Const(Value::Float(3.0)), Op::AddFloat, Op::Halt,
+        ]);
+        assert_eq!(compile_expr(r#"("a" + "b") == "ab""#), vec![
+            Op::Const(Value::Str("a".into())), Op::Const(Value::Str("b".into())), Op::AddStr,
+            Op::Const(Value::Str("ab".into())), Op::EqStr, Op::Halt,
+        ]);
+    }
+
+    #[test]
+    fn opcode_follows_param_and_return_types() {
+        let stmts = Parser::new("fn half(x: float) -> float { return x / 2.0; } let y = half(1.0) * 3.0;")
+            .parse_program().unwrap();
+        let mut c = Compiler::new();
+        let main = c.compile_program(&stmts).unwrap();
+        assert!(c.fns["half"].ops.contains(&Op::DivFloat));
+        assert!(main.ops.contains(&Op::MulFloat));
+    }
+
+    #[test]
+    fn neg_follows_variable_type() {
+        let ops = compile("let x = 1.5; let y = -x; let n = 2; let m = -n;");
+        assert_eq!(ops.iter().filter(|op| **op == Op::NegFloat).count(), 1);
+        assert_eq!(ops.iter().filter(|op| **op == Op::NegInt).count(), 1);
+    }
+
+    #[test]
+    fn unknown_type_falls_back_to_int_opcode() {
+        // no declared return type: the right operand decides, else int
+        let ops = compile("fn f() { return 1; } let a = f() + 2; let b = f() + 2.0;");
+        assert!(ops.contains(&Op::AddInt));
+        assert!(ops.contains(&Op::AddFloat));
+    }
+
+    #[test]
+    fn print_without_argument_prints_nil() {
+        assert_eq!(compile("print();"), vec![Op::Const(Value::Nil), Op::Print, Op::Pop, Op::Halt]);
     }
 
     #[test]
