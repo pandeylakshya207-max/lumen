@@ -35,9 +35,10 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
-    /// The lexer reports a character it does not know as Eof and stops.
-    /// When that happened the input was cut short, and this is set.
-    stray_char: bool,
+    /// A lexical error (unknown character, unterminated string, oversized
+    /// number). The lexer ends the token stream there, so the parser reports
+    /// this error when it reaches the end of the tokens.
+    lex_error: Option<ParseError>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,18 +59,9 @@ pub type ParseResult<T> = Result<T, ParseError>;
 impl Parser {
     pub fn new(src: &str) -> Self {
         let mut lexer = Lexer::new(src);
-        let mut tokens = Vec::new();
-        let mut stray_char = false;
-        loop {
-            lexer.skip_whitespace();
-            let at_end = lexer.is_at_end();
-            let tok = lexer.next_token();
-            let done = tok.kind == TokenKind::Eof;
-            if done { stray_char = !at_end; }
-            tokens.push(tok);
-            if done { break; }
-        }
-        Self { tokens, pos: 0, depth: 0, stray_char }
+        let tokens = lexer.tokenize();
+        let lex_error = lexer.error.take().map(|(msg, line, col)| ParseError { msg, line, col });
+        Self { tokens, pos: 0, depth: 0, lex_error }
     }
 
     // ---- token helpers -----------------------------------------------------
@@ -99,11 +91,11 @@ impl Parser {
 
     fn error<T>(&self, expected: &str) -> ParseResult<T> {
         let tok = self.peek();
-        let msg = if tok.kind == TokenKind::Eof && self.stray_char {
-            format!("expected {}, found a character lumen does not use", expected)
-        } else {
-            format!("expected {}, found {}", expected, describe(&tok.kind))
-        };
+        if tok.kind == TokenKind::Eof {
+            // the tokens ended early because of a lexical error: that is the real problem
+            if let Some(e) = &self.lex_error { return Err(e.clone()); }
+        }
+        let msg = format!("expected {}, found {}", expected, describe(&tok.kind));
         Err(ParseError { msg, line: tok.line, col: tok.col })
     }
 
@@ -124,7 +116,7 @@ impl Parser {
     /// Ends a statement: ";" or, on the last statement only, the end of the input.
     fn end_stmt(&mut self) -> ParseResult<()> {
         if self.match_tok(&TokenKind::Semicolon) { return Ok(()); }
-        if self.is_at_end() && !self.stray_char { return Ok(()); }
+        if self.is_at_end() && self.lex_error.is_none() { return Ok(()); }
         self.error("';'")
     }
 
@@ -150,10 +142,10 @@ impl Parser {
         while !self.is_at_end() {
             stmts.push(self.parse_stmt()?);
         }
-        if self.stray_char {
-            return self.error("a statement");
+        match &self.lex_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(stmts),
         }
-        Ok(stmts)
     }
 
     fn parse_stmt(&mut self) -> ParseResult<Stmt> {
@@ -242,7 +234,7 @@ impl Parser {
         self.advance(); // return
         let bare = self.check(&TokenKind::Semicolon)
             || self.check(&TokenKind::RBrace)
-            || (self.is_at_end() && !self.stray_char);
+            || (self.is_at_end() && self.lex_error.is_none());
         let value = if bare { Expr::Nil } else { self.parse_expr()? };
         self.end_stmt()?;
         Ok(Stmt::Return(value))
@@ -672,8 +664,29 @@ mod tests {
 
     #[test]
     fn unknown_character_is_reported() {
-        assert_eq!(err("let x = 1; @").msg, "expected a statement, found a character lumen does not use");
-        assert_eq!(err("let x = 1 # 2;").msg, "expected ';', found a character lumen does not use");
+        assert_eq!(err("let x = 1; @").msg, "unexpected character '@'");
+        let e = err("let x = 1 # 2;");
+        assert_eq!((e.msg.as_str(), e.line, e.col), ("unexpected character '#'", 1, 11));
+        assert_eq!(err("a & b;").msg, "expected '&&', found a single '&'");
+    }
+
+    #[test]
+    fn unterminated_string_is_reported() {
+        let e = err("let s = \"abc; s;");
+        assert_eq!((e.msg.as_str(), e.line, e.col), ("unterminated string", 1, 9));
+        assert_eq!(Parser::new("\"abc").parse_expr().unwrap_err().msg, "unterminated string");
+    }
+
+    #[test]
+    fn oversized_integer_is_reported() {
+        assert_eq!(err("let x = 99999999999999999999;").msg, "integer literal 99999999999999999999 is too large");
+        assert_eq!(program("9223372036854775807;"), vec![Stmt::ExprStmt(Expr::Int(i64::MAX))]);
+    }
+
+    #[test]
+    fn lexical_error_wins_over_a_missing_semicolon() {
+        // without the stray character this input would be a complete program
+        assert_eq!(err("1 + 2 $").msg, "unexpected character '$'");
     }
 
     #[test]

@@ -63,6 +63,14 @@ fn hand_written_programs_agree() {
     }
 }
 
+/// The program shown in the README runs, and gives the same result on both backends.
+#[test]
+fn example_program_agrees() {
+    let (vm, it) = both(include_str!("../examples/demo.lm"));
+    assert_eq!(vm, "Int(80)");
+    assert_eq!(it, vm);
+}
+
 /// Both backends allow the same number of nested calls and fail the same way
 /// beyond it. The interpreter needs several native frames per call, so this
 /// runs on a thread with a large stack, as the command-line tool does.

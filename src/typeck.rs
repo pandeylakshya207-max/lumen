@@ -90,6 +90,12 @@ impl TypeChecker {
         // first pass: register all fn signatures so forward calls work
         for stmt in stmts {
             if let Stmt::Fn { name, params, ret, .. } = stmt {
+                if name == "print" {
+                    return Err(TypeError::new("'print' is a built-in function and cannot be redefined"));
+                }
+                if self.fns.contains_key(name) {
+                    return Err(TypeError::new(format!("function '{}' is declared twice", name)));
+                }
                 let param_tys: Vec<Ty> = params.iter().map(|(_, ty)| ty.clone()).collect();
                 let ret_ty = ret.clone().unwrap_or(Ty::Nil);
                 self.fns.insert(name.clone(), FnSig { params: param_tys, ret: ret_ty });
@@ -105,11 +111,26 @@ impl TypeChecker {
 // ── statement checking ────────────────────────────────────────────────────────
 
 impl TypeChecker {
+    /// Checks the statements of a block. Functions live at the top level only:
+    /// neither backend compiles or hoists one declared inside a block.
+    fn check_block(&mut self, stmts: &[Stmt]) -> TyResult<()> {
+        for stmt in stmts {
+            if let Stmt::Fn { name, .. } = stmt {
+                return Err(TypeError::new(format!(
+                    "function '{}' is declared inside a block; functions can only be declared at the top level", name
+                )));
+            }
+            self.check_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) -> TyResult<()> {
         match stmt {
             Stmt::Let { name, ty, init } => {
                 let init_ty = self.check_expr(init)?;
                 if let Some(ann) = ty {
+                    known_type(ann)?;
                     if !ty_compat(ann, &init_ty) {
                         return Err(TypeError::new(format!(
                             "type mismatch in let '{}': declared {:?} but got {:?}",
@@ -146,11 +167,11 @@ impl TypeChecker {
                     )));
                 }
                 self.env.push();
-                for s in then { self.check_stmt(s)?; }
+                self.check_block(then)?;
                 self.env.pop();
                 if let Some(else_stmts) = else_ {
                     self.env.push();
-                    for s in else_stmts { self.check_stmt(s)?; }
+                    self.check_block(else_stmts)?;
                     self.env.pop();
                 }
                 Ok(())
@@ -164,7 +185,7 @@ impl TypeChecker {
                     )));
                 }
                 self.env.push();
-                for s in body { self.check_stmt(s)?; }
+                self.check_block(body)?;
                 self.env.pop();
                 Ok(())
             }
@@ -184,6 +205,8 @@ impl TypeChecker {
 
             Stmt::Fn { name, params, ret, body } => {
                 let ret_ty = ret.clone().unwrap_or(Ty::Nil);
+                params.iter().try_for_each(|(_, ty)| known_type(ty))?;
+                known_type(&ret_ty)?;
                 // register sig (may already exist from first pass — overwrite is fine)
                 let param_tys: Vec<Ty> = params.iter().map(|(_, ty)| ty.clone()).collect();
                 self.fns.insert(name.clone(), FnSig { params: param_tys, ret: ret_ty.clone() });
@@ -191,16 +214,24 @@ impl TypeChecker {
                 // A function body sees only its parameters and its own locals,
                 // never the variables of the code around it, so it is checked
                 // in a fresh environment.
-                let prev_ret = self.current_ret.replace(ret_ty);
+                let prev_ret = self.current_ret.replace(ret_ty.clone());
                 let outer = std::mem::take(&mut self.env);
                 self.env.push();
                 for (pname, pty) in params {
                     self.env.define(pname, pty.clone());
                 }
-                let checked = body.iter().try_for_each(|s| self.check_stmt(s));
+                let checked = self.check_block(body);
                 self.env = outer;
                 self.current_ret = prev_ret;
-                checked
+                checked?;
+
+                // a function that promises a value must return one on every path
+                if ret_ty != Ty::Nil && !always_returns(body) {
+                    return Err(TypeError::new(format!(
+                        "function '{}' can reach its end without returning a value of type {:?}", name, ret_ty
+                    )));
+                }
+                Ok(())
             }
         }
     }
@@ -324,6 +355,26 @@ fn check_binary(op: &BinOp, lt: &Ty, rt: &Ty) -> TyResult<Ty> {
             }
         }
     }
+}
+
+/// The built-in types are the only ones; the parser also accepts other names
+/// in type position, and they are rejected here.
+fn known_type(ty: &Ty) -> TyResult<()> {
+    match ty {
+        Ty::Named(name) => Err(TypeError::new(format!("unknown type '{}'", name))),
+        _ => Ok(()),
+    }
+}
+
+/// True when control can never run off the end of `stmts`: some statement in
+/// it returns on every path. `while true` counts, since lumen has no `break`.
+fn always_returns(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return(_) => true,
+        Stmt::If { then, else_: Some(else_stmts), .. } => always_returns(then) && always_returns(else_stmts),
+        Stmt::While { cond: Expr::Bool(true), .. } => true,
+        _ => false,
+    })
 }
 
 /// Structural type compatibility (for now: exact match or Named wildcard).
@@ -522,6 +573,56 @@ mod tests {
     #[test]
     fn fn_param_may_reuse_an_outer_name() {
         assert!(check("let x = true; fn f(x: int) -> int { return x + 1; } f(2);").is_ok());
+    }
+
+    #[test]
+    fn fn_must_return_on_every_path() {
+        assert!(check("fn f() -> int { }").is_err());
+        assert!(check("fn f(a: bool) -> int { if a { return 1; } }").is_err());
+        assert!(check("fn f(a: bool) -> int { if a { return 1; } else { let x = 2; } }").is_err());
+        assert!(check("fn f(a: bool) -> int { while a { return 1; } }").is_err());
+    }
+
+    #[test]
+    fn fn_returning_on_every_path_is_ok() {
+        assert!(check("fn f(a: bool) -> int { if a { return 1; } return 2; }").is_ok());
+        assert!(check("fn f(a: bool) -> int { if a { return 1; } else { return 2; } }").is_ok());
+        assert!(check("fn f(a: bool, b: bool) -> int { if a { return 1; } else if b { return 2; } else { return 3; } }").is_ok());
+        assert!(check("fn f() -> int { while true { return 1; } }").is_ok());
+    }
+
+    #[test]
+    fn fn_without_return_type_need_not_return() {
+        assert!(check("fn f(a: bool) { if a { return; } }").is_ok());
+        assert!(check("fn f() -> nil { }").is_ok());
+    }
+
+    #[test]
+    fn unknown_type_names_are_rejected() {
+        assert_eq!(check("let x: Point = 1;").unwrap_err().msg, "unknown type 'Point'");
+        assert_eq!(check("fn f(a: Point) { }").unwrap_err().msg, "unknown type 'Point'");
+        assert_eq!(check("fn f() -> Point { return 1; }").unwrap_err().msg, "unknown type 'Point'");
+    }
+
+    #[test]
+    fn print_cannot_be_redefined() {
+        assert!(check("fn print(x: int) -> int { return x; }").unwrap_err().msg.contains("built-in"));
+    }
+
+    #[test]
+    fn duplicate_function_is_rejected() {
+        assert_eq!(check("fn f() { } fn f() { }").unwrap_err().msg, "function 'f' is declared twice");
+    }
+
+    #[test]
+    fn nested_function_is_rejected() {
+        assert!(check("if true { fn f() { } }").unwrap_err().msg.contains("top level"));
+        assert!(check("fn outer() { fn inner() { } }").unwrap_err().msg.contains("top level"));
+    }
+
+    #[test]
+    fn call_before_declaration_is_ok() {
+        assert!(check("let x = f(1); fn f(a: int) -> int { return a; }").is_ok());
     }
 
     #[test]
