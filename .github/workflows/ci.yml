@@ -20,3 +20,6 @@ jobs:
         run: cargo build
       - name: Test
         run: cargo test
+      - name: Benchmark (release build, informational)
+        if: runner.os == 'Linux'
+        run: cargo run --release -- --bench
