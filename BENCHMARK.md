@@ -1,48 +1,48 @@
-# Lumen — VM vs Tree-Walking Interpreter Benchmark
+# Benchmark: bytecode VM vs tree-walking interpreter
 
-Lumen ships two execution backends:
+Lumen has two execution backends behind one front end (lexer, parser, type checker):
 
-- **Bytecode VM** (`src/compiler.rs` + `src/vm.rs`) — compiles the AST to a flat `Vec<Op>` of typed opcodes then executes on a stack machine with a flat locals pool and call frames.
-- **Tree-walking interpreter** (`src/interpreter.rs`) — walks AST nodes directly, using a `Vec<HashMap>` scope chain for variable lookup and cloning `FnDef` structs on each call.
-
-Both backends use the same lexer, parser, and type checker. The comparison is purely about execution strategy.
+- **Bytecode VM** (`src/compiler.rs`, `src/vm.rs`): the AST is compiled to a flat list of typed opcodes and run on a stack machine. Variables are slot indices into a flat locals pool.
+- **Tree-walking interpreter** (`src/interpreter.rs`): the AST is evaluated directly. Variables live in a chain of hash maps, one per scope.
 
 ## Results
 
-Hardware: Ubuntu 24 (Linux), single core, release build (`opt-level = 3`).  
-Each program run **10 000 iterations**; timing shown is **average nanoseconds per run**.
+| # | Program | VM | Interpreter | Faster |
+| --- | --- | ---: | ---: | --- |
+| 1 | `1 + 2;` | 111 ns | 54 ns | interpreter, 2.06x |
+| 2 | `let x = 10; let y = 20; let z = x + y; z;` | 199 ns | 262 ns | VM, 1.32x |
+| 3 | `fn add(a: int, b: int) -> int { return a + b; } add(3, 4);` | 366 ns | 619 ns | VM, 1.69x |
+| 4 | `let x = true; if x { let y = 1; } else { let y = 2; } nil;` | 195 ns | 199 ns | VM, 1.02x |
+| 5 | `let a = 0; let b = 1; let i = 0; while i < 10 { let tmp = b; b = a + b; a = tmp; i = i + 1; } a;` | 1,139 ns | 4,919 ns | VM, 4.32x |
+| 6 | `fn fib(n: int) -> int { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fib(10);` | 52,401 ns | 123,594 ns | VM, 2.36x |
+| 7 | `let x = 1.5; let i = 0; while i < 20 { x = x * 1.01 + 0.5; i = i + 1; } x;` | 1,804 ns | 4,970 ns | VM, 2.75x |
 
-```
-Program                                               VM (ns)   Interp (ns)   Winner
-─────────────────────────────────────────────────────────────────────────────────────
-1 + 2;                                                     92           72   Interp ×1.28
-let x = 10; let y = 20; let z = x + y; z;                150          305   VM     ×2.03
-fn add(a: int, b: int) { return a; } add(3, 4);           305          577   VM     ×1.89
-if/else branch (bool cond, two let bodies)                147          237   VM     ×1.61
-Fibonacci-10 iterative (while + assign loop)             1086         5540   VM     ×5.10
-```
+**How these were measured**
 
-## Analysis
+- GitHub Actions `ubuntu-latest` runner, release build (`opt-level = 3`), commit `3d16356`, CI run 37895269496.
+- Each program is run 10,000 times per backend; the figure is the mean wall-clock time of one run.
+- The timed region is execution only. Parsing, type checking and compiling to bytecode happen once, before the clock starts.
+- Each timed run starts from scratch: the VM run clones the compiled bytecode and function table into a new `Vm`; the interpreter run builds a new `Interpreter` and registers the functions again.
 
-**Why the interpreter wins on `1 + 2;` (×1.28)**
+**How far to trust them**
 
-The VM pipeline has fixed startup overhead: `compile_program()` allocates a `Vec<Op>`, `Vm::new()` clones the `fns` HashMap, and the dispatch loop enters. For a 3-instruction program (`Const`, `Const`, `AddInt`) this overhead exceeds the cost of a single `eval_expr` recursive call. The crossover happens once programs have 3+ variables.
+This is one run on a shared CI machine. There is no warm-up, no repetition and no variance estimate, so treat differences of a few percent as noise: program 4 is a tie. On repeated runs the ordering stays the same and the larger ratios move by a few tenths. CI prints a fresh table on every push (the `Benchmark` step of the Linux job).
 
-**Why the VM dominates everywhere else**
+## Reading the results
 
-Variable lookup is the core difference. The interpreter walks a `Vec<HashMap>` scope chain on every `Var` expression — hashing the name, searching scopes in reverse. The VM resolves variable names to integer slot indices at compile time; `LoadLocal(n)` is a direct `locals[base + n]` array index — no hashing, no scope walk, no iteration.
+**Program 1: the interpreter wins on a trivial program.** `1 + 2;` is five instructions on the VM and one small tree in the interpreter. At this size the fixed cost of starting a run dominates, and the VM's is larger: it clones the bytecode and the function table before executing anything.
 
-**Function calls (×1.89)**
+**Programs 2, 5 and 7: variables are where the VM pulls ahead.** The interpreter resolves a variable by hashing its name and searching the scope chain from the innermost scope outwards, and it sets up and tears down a scope map every time a block is entered, which in a loop means once per iteration. The VM resolved every name to a slot index at compile time, so a read is one array index. The gap grows with the number of variable accesses: 1.3x for three variables, 4.3x for a ten-iteration loop that touches four variables per iteration.
 
-The interpreter clones the entire `FnDef` (params + body `Vec<Stmt>`) on each call. The VM calls into a pre-compiled `Chunk` (`Vec<Op>`), pushes a `Frame`, and binds args by moving `Value`s into the locals pool — cheaper, and the delta grows with call frequency.
+**Programs 3 and 6: function calls.** The VM is ahead here too, but by less than in the loops. Both backends do avoidable work on every call: the interpreter clones the function's parameter list and body, and the VM clones the callee's bytecode into the new frame. Sharing these through a reference-counted pointer would speed up both.
 
-**While loop / iteration (×5.10)**
+**Program 4: no difference.** One variable read and one branch is too little work for the backends to separate.
 
-The clearest signal. The iterative Fibonacci-10 program accesses `i`, `a`, `b`, `tmp` on every iteration — 4 lookups and 4 stores per loop body. The interpreter scope-walks each one; the VM dispatches each as a direct array index. Over 10 iterations × 10 000 benchmark runs the difference dominates.
+## What this does and does not show
 
-**Takeaway**
+It shows that, for this language and these implementations, compiling to bytecode with resolved slots is two to four times faster than walking the tree once a program loops or calls functions. That is the same direction as the trade-off made by CPython, Ruby and Lua, which all compile to bytecode.
 
-The tree-walking interpreter is simpler to write and fast enough for short scripts. The bytecode VM becomes meaningfully faster the moment programs use variables and loops — which is almost every real program. This matches how production language runtimes make the same tradeoff (CPython bytecode VM, Ruby YARV, etc.).
+It does not show how fast lumen is in absolute terms. Neither backend has been optimized: there is no constant folding, values are cloned freely (the VM clones each instruction as it dispatches it), and dispatch is a plain `match`. The programs are also tiny. The comparison is between two straightforward implementations of the same semantics, checked against each other by the differential test in `tests/backends_agree.rs`.
 
 ## Reproducing
 
@@ -50,10 +50,11 @@ The tree-walking interpreter is simpler to write and fast enough for short scrip
 cargo run --release -- --bench
 ```
 
-To time a single program in code:
+To time one program from code:
 
 ```rust
 use lumen::bench::bench;
+
 let result = bench("let x = 0; while x < 100 { x = x + 1; } x;", 10_000);
 println!("{}", result);
 ```
